@@ -35,7 +35,7 @@ export interface EcsCdkStackProps extends cdk.StackProps {
 export class EcsCdkStack extends cdk.Stack {
   public readonly cluster: ecs.Cluster;
   public readonly service: ecsPatterns.ApplicationLoadBalancedFargateService;
-  public readonly repository: ecr.Repository;
+  public readonly repository: ecr.IRepository;
   public readonly secret?: secretsmanager.ISecret;
 
   constructor(scope: Construct, id: string, props: EcsCdkStackProps) {
@@ -71,17 +71,7 @@ export class EcsCdkStack extends cdk.Stack {
       natGateways,
     });
 
-    this.repository = new ecr.Repository(this, 'Repository', {
-      repositoryName: `ecs-app-${props.envName}`,
-      removalPolicy: cdk.RemovalPolicy.RETAIN,
-      imageScanOnPush: true,
-      lifecycleRules: [
-        {
-          maxImageCount: 10,
-          description: 'Keep only 10 images',
-        },
-      ],
-    });
+    this.repository = ecr.Repository.fromRepositoryName(this, 'Repository', `ecs-app-${props.envName}`);
 
     this.cluster = new ecs.Cluster(this, 'Cluster', {
       vpc,
