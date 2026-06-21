@@ -21,7 +21,7 @@ const envConfigs: Record<string, Partial<EcsCdkStackProps>> = {
     nodeEnv: 'development',
     secrets: {
       secretName: 'app-secrets',
-      keys: ['DATABASE_URL', 'API_KEY', 'REDIS_URL'],
+      keys: ['REACT_APP_SHARETRIBE_SDK_CLIENT_ID', 'SHARETRIBE_SDK_CLIENT_SECRET', 'REACT_APP_MARKETPLACE_NAME', 'REACT_APP_MARKETPLACE_ROOT_URL'],
     },
   },
   staging: {

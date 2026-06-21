@@ -3,156 +3,10 @@
 ## Прerequisites
 
 - Docker Desktop запущен
-- AWS CLI настроен с профилем `ama`
+- AWS CLI настроен с профилем `ama` (аккаунт `992382855794`)
 - Node.js установлен
 
-## Проблема предыдущего деплоя
-
-CDK создаёт ECS Service и ECR одновременно. ECS пытается запустить таск, тянет образ из ECR — а образа там нет. Health check падает → Circuit Breaker → откат всего стека.
-
-**Решение:** сначала создать ECR вручную и запушить образ, потом задеплоить CDK.
-
----
-
-## Шаг 1 — Установить зависимости CDK
-
-```powershell
-cd C:\work\kiro\CDK\cdk-ama
-npm install
-```
-
-## Шаг 2 — Залогиниться в ECR
-
-```powershell
-aws ecr get-login-password --region us-east-1 --profile ama | docker login --username AWS --password-stdin 992382855794.dkr.ecr.us-east-1.amazonaws.com
-```
-
-Если логин успешен, увидите: `Login Succeeded`
-
-## Шаг 3 — Создать ECR репозиторий вручную
-
-```powershell
-aws ecr create-repository --repository-name ecs-app-dev --region us-east-1 --profile ama
-```
-
-## Шаг 4 — Собрать Docker-образ
-
-Dockerfile лежит в `app/`. Собирать из папки `app/`:
-
-```powershell
-cd C:\work\kiro\CDK\cdk-ama\app
-docker build -t ecs-app-dev:latest .
-```
-
-Проверить что образ создался:
-
-```powershell
-docker images ecs-app-dev
-```
-
-Проверить что образ создался:
-
-```powershell
-docker images ecs-app-dev
-```
-
-## Шаг 5 — Запушить образ в ECR
-
-```powershell
-docker tag ecs-app-dev:latest 992382855794.dkr.ecr.us-east-1.amazonaws.com/ecs-app-dev:latest
-docker push 992382855794.dkr.ecr.us-east-1.amazonaws.com/ecs-app-dev:latest
-```
-
-Проверить что образ в ECR:
-
-```powershell
-aws ecr describe-images --repository-name ecs-app-dev --region us-east-1 --profile ama --query "imageDetails[0:imagePushedAt,imageDigest,imageTags]"
-```
-
-## Шаг 6 — Изменить CDK стек (импорт существующего ECR)
-
-Сообщи когда шаги 1-5 выполнены — я поправлю `lib/ecs-cdk-stack.ts`, чтобы CDK **импортировал** существующий ECR репозиторий вместо создания нового.
-
-Изменение в `ecs-cdk-stack.ts`:
-```typescript
-// Было (создание нового):
-this.repository = new ecr.Repository(this, 'Repository', { ... });
-
-// Станет (импорт существующего):
-this.repository = ecr.Repository.fromRepositoryName(this, 'Repository', 'ecs-app-dev');
-```
-
-## Шаг 7 — Задеплоить CDK стек
-
-```powershell
-$env:CDK_DEFAULT_REGION='us-east-1'; $env:AWS_PROFILE='ama'; npx cdk deploy --context env=dev
-```
-
-Подтверди когда спросит `(y/n)` — введи `y`.
-
-## Шаг 8 — Проверить деплой
-
-После завершения CDK выведет:
-
-```
-Outputs:
-EcsCdkStack-dev.LoadBalancerDNS = <DNS>
-EcsCdkStack-dev.ServiceURL = http://<DNS>
-EcsCdkStack-dev.ECRRepositoryUri = <URI>
-```
-
-Открой `ServiceURL` в браузере — должна открыться страница `{"message":"Hello from ECS Fargate!"}`.
-
-Проверить health check:
-
-```powershell
-curl http://<DNS>/health
-```
-
-Должен вернуть: `{"status":"healthy","timestamp":"..."}`
-
-## Шаг 9 — Записать секреты
-
-```powershell
-aws secretsmanager put-secret-value --secret-id dev/app-secrets --secret-string '{"DATABASE_URL":"postgres://user:pass@host:5432/db","API_KEY":"your-api-key","REDIS_URL":"redis://host:6379"}' --profile ama --region us-east-1
-```
-
-## Шаг 10 — (Опционально) Настроить SSL
-
-1. Создать сертификат в ACM (us-east-1):
-```powershell
-aws acm request-certificate --domain-name your-domain.com --validation-method DNS --profile ama --region us-east-1
-```
-
-2. Дождаться выдачи сертификата (статус `ISSUED`)
-
-3. Перезадеплоить с `certificateArn`:
-```powershell
-$env:CDK_DEFAULT_REGION='us-east-1'; $env:AWS_PROFILE='ama'; npx cdk deploy --context env=dev --context certificateArn=arn:aws:acm:us-east-1:992382855794:certificate/ID-СЕРТИФИКАТА
-```
-
----
-
-## Полезные команды
-
-```powershell
-# Посмотреть список стеков
-npx cdk list --context env=dev
-
-# Посмотреть diff (что изменится)
-npx cdk diff --context env=dev
-
-# Удалить стек (все ресурсы)
-$env:CDK_DEFAULT_REGION='us-east-1'; $env:AWS_PROFILE='ama'; npx cdk destroy --context env=dev
-
-# Логи ECS тасков
-aws logs tail /ecs/EcsCdkStack-dev-TaskDefAppContainer --follow --profile ama --region us-east-1
-
-# Список образов в ECR
-aws ecr describe-images --repository-name ecs-app-dev --region us-east-1 --profile ama
-```
-
-## Архитектура (что будет создано)
+## Архитектура
 
 ```
 VPC (2 AZ)
@@ -168,7 +22,217 @@ ECS Cluster
 ├── Fargate Service (1 task, min 1, max 3)
 ├── Task: 256 CPU, 512 MB
 ├── Auto-scaling: CPU 80%, Memory 80%, Requests 500/target
-└── Secrets: dev/app-secrets (DATABASE_URL, API_KEY, REDIS_URL)
+└── Secrets: dev/app-secrets
 
-ECR Repository: ecs-app-dev (создан вручную на шаге 3)
+ECR Repository: ecs-app-dev (removalPolicy: RETAIN)
+Secrets Manager: dev/app-secrets (removalPolicy: RETAIN)
+```
+
+---
+
+## Первичная настройка (выполнить один раз)
+
+### 1. Установить зависимости CDK
+
+```powershell
+cd C:\work\kiro\CDK\cdk-ama
+npm install
+```
+
+### 2. Бутстрап CDK
+
+```powershell
+$env:CDK_DEFAULT_REGION='us-east-1'; $env:AWS_PROFILE='ama'; npx cdk bootstrap
+```
+
+### 3. Залогиниться в ECR
+
+```powershell
+aws ecr get-login-password --region us-east-1 --profile ama | docker login --username AWS --password-stdin 992382855794.dkr.ecr.us-east-1.amazonaws.com
+```
+
+### 4. Создать ECR репозиторий
+
+```powershell
+aws ecr create-repository --repository-name ecs-app-dev --region us-east-1 --profile ama
+```
+
+### 5. Записать секреты в Secrets Manager
+
+```powershell
+aws secretsmanager create-secret --name dev/app-secrets --secret-string '{"REACT_APP_SHARETRIBE_SDK_CLIENT_ID":"123","SHARETRIBE_SDK_CLIENT_SECRET":"456","REACT_APP_MARKETPLACE_NAME":"Test","REACT_APP_MARKETPLACE_ROOT_URL":"http://PLACEHOLDER"}' --region us-east-1 --profile ama
+```
+
+После деплоя обновить `REACT_APP_MARKETPLACE_ROOT_URL` на реальный URL ALB:
+
+```powershell
+aws secretsmanager put-secret-value --secret-id dev/app-secrets --secret-string '{"REACT_APP_SHARETRIBE_SDK_CLIENT_ID":"123","SHARETRIBE_SDK_CLIENT_SECRET":"456","REACT_APP_MARKETPLACE_NAME":"Test","REACT_APP_MARKETPLACE_ROOT_URL":"http://<ALB_DNS>"}' --region us-east-1 --profile ama
+```
+
+---
+
+## Деплой с нуля (полная переустановка)
+
+### Шаг 1 — Удалить существующий стек
+
+```powershell
+$env:CDK_DEFAULT_REGION='us-east-1'; $env:AWS_PROFILE='ama'; npx cdk destroy --context env=dev
+```
+
+Подтверди `y`. ECR репозиторий и Secrets Manager **не удаляются** (removalPolicy: RETAIN).
+
+### Шаг 2 — Пересобрать Docker-образ
+
+```powershell
+cd C:\work\kiro\CDK\cdk-ama\app
+docker build -t ecs-app-dev:latest .
+```
+
+### Шаг 3 — Запушить образ в ECR
+
+```powershell
+docker tag ecs-app-dev:latest 992382855794.dkr.ecr.us-east-1.amazonaws.com/ecs-app-dev:latest
+docker push 992382855794.dkr.ecr.us-east-1.amazonaws.com/ecs-app-dev:latest
+```
+
+### Шаг 4 — Задеплоить CDK стек
+
+```powershell
+cd C:\work\kiro\CDK\cdk-ama
+$env:CDK_DEFAULT_REGION='us-east-1'; $env:AWS_PROFILE='ama'; npx cdk deploy --context env=dev
+```
+
+Подтверди `y`.
+
+### Шаг 5 — Проверить
+
+```powershell
+# Health check
+curl http://<ALB_DNS>/health
+
+# Основной эндпоинт
+curl http://<ALB_DNS>/
+```
+
+Ожидаемый ответ:
+```json
+{"status":"healthy","timestamp":"..."}
+{"message":"Hello from ECS Fargate!"}
+```
+
+---
+
+## Обновление приложения (без удаления инфры)
+
+### 1. Пересобрать и запушить образ
+
+```powershell
+cd C:\work\kiro\CDK\cdk-ama\app
+docker build -t ecs-app-dev:latest .
+docker tag ecs-app-dev:latest 992382855794.dkr.ecr.us-east-1.amazonaws.com/ecs-app-dev:latest
+docker push 992382855794.dkr.ecr.us-east-1.amazonaws.com/ecs-app-dev:latest
+```
+
+### 2. Обновить ECS Service (принудительный ребилд)
+
+```powershell
+aws ecs update-service --cluster EcsCdkStack-dev-ClusterEB0386A7 --service FargateService --force-new-deployment --region us-east-1 --profile ama
+```
+
+---
+
+## Обновление секретов
+
+```powershell
+aws secretsmanager put-secret-value --secret-id dev/app-secrets --secret-string '{"REACT_APP_SHARETRIBE_SDK_CLIENT_ID":"новое","SHARETRIBE_SDK_CLIENT_SECRET":"новое","REACT_APP_MARKETPLACE_NAME":"новое","REACT_APP_MARKETPLACE_ROOT_URL":"http://новое"}' --region us-east-1 --profile ama
+```
+
+После обновления перезапустить таски:
+
+```powershell
+aws ecs update-service --cluster EcsCdkStack-dev-ClusterEB0386A7 --service FargateService --force-new-deployment --region us-east-1 --profile ama
+```
+
+---
+
+## (Опционально) Настроить SSL
+
+### 1. Создать сертификат в ACM (us-east-1)
+
+```powershell
+aws acm request-certificate --domain-name your-domain.com --validation-method DNS --profile ama --region us-east-1
+```
+
+### 2. Дождаться выдачи сертификата (статус `ISSUED`)
+
+```powershell
+aws acm describe-certificate --certificate-arn <ARN> --region us-east-1 --profile ama
+```
+
+### 3. Перезадеплоить с certificateArn
+
+```powershell
+$env:CDK_DEFAULT_REGION='us-east-1'; $env:AWS_PROFILE='ama'; npx cdk deploy --context env=dev --context certificateArn=arn:aws:acm:us-east-1:992382855794:certificate/<ID>
+```
+
+---
+
+## Полезные команды
+
+```powershell
+# Список стеков
+npx cdk list --context env=dev
+
+# Diff (что изменится)
+npx cdk diff --context env=dev
+
+# Удалить стек
+$env:CDK_DEFAULT_REGION='us-east-1'; $env:AWS_PROFILE='ama'; npx cdk destroy --context env=dev
+
+# Логи ECS тасков
+aws logs tail /ecs/EcsCdkStack-dev-TaskDefAppContainer --follow --profile ama --region us-east-1
+
+# Список образов в ECR
+aws ecr describe-images --repository-name ecs-app-dev --region us-east-1 --profile ama
+
+# Прочитать секреты
+aws secretsmanager get-secret-value --secret-id dev/app-secrets --region us-east-1 --profile ama
+
+# Принудительный ребилд ECS Service
+aws ecs update-service --cluster EcsCdkStack-dev-ClusterEB0386A7 --service FargateService --force-new-deployment --region us-east-1 --profile ama
+```
+
+---
+
+## Структура проекта
+
+```
+cdk-ama/
+├── bin/ecs-cdk.ts              # Entry point, конфигурация окружений
+├── lib/ecs-cdk-stack.ts        # CDK стек (VPC, ECS, ALB, ECR, Secrets)
+├── app/
+│   ├── Dockerfile              # Сборка контейнера
+│   ├── package.json            # Зависимости приложения
+│   └── src/index.js            # Express приложение
+├── .github/workflows/deploy.yml # CI/CD (GitHub Actions)
+├── cdk.json                    # CDK конфигурация
+└── DEPLOY.md                   # Этот файл
+```
+
+## Multi-environment
+
+| Параметр | dev | staging | prod |
+|----------|-----|---------|------|
+| AZs | 2 | 2 | 3 |
+| NAT Gateways | 1 | 1 | 2 |
+| CPU | 256 | 512 | 512 |
+| Memory (MB) | 512 | 1024 | 1024 |
+| Desired Count | 1 | 2 | 3 |
+| Min/Max | 1/3 | 2/5 | 3/20 |
+
+Деплой по окружениям:
+```powershell
+npx cdk deploy --context env=dev
+npx cdk deploy --context env=staging
+npx cdk deploy --context env=prod
 ```

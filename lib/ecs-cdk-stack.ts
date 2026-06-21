@@ -56,14 +56,7 @@ export class EcsCdkStack extends cdk.Stack {
     const imageTag = props.imageTag ?? 'latest';
 
     if (props.secrets) {
-      this.secret = new secretsmanager.Secret(this, 'AppSecret', {
-        secretName: `${props.envName}/${props.secrets.secretName}`,
-        description: `Secrets for ${props.envName} environment`,
-        generateSecretString: {
-          secretStringTemplate: JSON.stringify({}),
-          generateStringKey: 'placeholder',
-        },
-      });
+      this.secret = secretsmanager.Secret.fromSecretNameV2(this, 'AppSecret', `${props.envName}/${props.secrets.secretName}`);
     }
 
     const vpc = new ec2.Vpc(this, 'Vpc', {
@@ -99,13 +92,6 @@ export class EcsCdkStack extends cdk.Stack {
             ])
           )
         : undefined,
-      healthCheck: {
-        command: ['CMD-SHELL', `curl -f http://localhost:${containerPort}/health || exit 1`],
-        interval: cdk.Duration.seconds(30),
-        timeout: cdk.Duration.seconds(5),
-        retries: 3,
-        startPeriod: cdk.Duration.seconds(60),
-      },
     });
 
     let certificate: acm.ICertificate | undefined;
