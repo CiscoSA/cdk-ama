@@ -1,6 +1,6 @@
 *.js
 !jest.config.js
-!app/src/**/*.js
+# !app/src/**/*.js
 *.d.ts
 node_modules
 app/node_modules
