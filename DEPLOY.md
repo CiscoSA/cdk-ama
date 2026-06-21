@@ -204,6 +204,87 @@ aws ecs update-service --cluster EcsCdkStack-dev-ClusterEB0386A7 --service Farga
 
 ---
 
+## ECS Exec — вход в контейнер (аналог docker exec)
+
+### Установить SSM Plugin (один раз)
+
+```powershell
+# Windows (winget)
+winget install Amazon.ECSCLI
+
+# Или скачать вручную: https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs-exec.html
+```
+
+Проверить что плагин установлен:
+
+```powershell
+session-manager-plugin
+```
+
+### Найти task ID
+
+```powershell
+aws ecs list-tasks --cluster EcsCdkStack-dev-ClusterEB0386A7 --region us-east-1 --profile ama
+```
+
+Вывод:
+```json
+{
+    "taskArns": [
+        "arn:aws:ecs:us-east-1:992382855794:task/EcsCdkStack-dev-ClusterEB0386A7/abc123..."
+    ]
+}
+```
+
+Извлечь task ID из ARN (последняя часть после `/`).
+
+### Войти в контейнер
+
+```powershell
+aws ecs execute-command `
+  --cluster EcsCdkStack-dev-ClusterEB0386A7 `
+  --task <TASK_ID> `
+  --container app `
+  --interactive `
+  --command "/bin/sh" `
+  --region us-east-1 `
+  --profile ama
+```
+
+### Полезные команды внутри контейнера
+
+```sh
+# Проверить переменные окружения
+env
+
+# Проверить что слушает приложение
+netstat -tlnp
+
+# Проверить health check
+wget -qO- http://localhost:3000/health
+
+# Посмотреть процессы
+ps aux
+
+# Выйти
+exit
+```
+
+### Удаленный контейнер (non-interactive)
+
+```powershell
+# Выполнить команду и выйти
+aws ecs execute-command `
+  --cluster EcsCdkStack-dev-ClusterEB0386A7 `
+  --task <TASK_ID> `
+  --container app `
+  --command "cat /app/src/index.js" `
+  --region us-east-1 `
+  --profile ama
+```
+
+---
+
 ## Структура проекта
 
 ```

@@ -1,14 +1,15 @@
-name: Build and Push to ECR
+name: Build, Push to ECR and Deploy to Dev
 
 on:
   push:
-    branches: [main]
+    branches: [dev]
   pull_request:
-    branches: [main]
+    branches: [dev]
 
 env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: ecs-app-dev
+  CDK_STACK: EcsCdkStack-dev
 
 jobs:
   build:
@@ -33,16 +34,17 @@ jobs:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
+          cd app
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
           echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
 
-  deploy-dev:
+  deploy:
     needs: build
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -54,11 +56,27 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Install CDK
-        run: npm install -g aws-cdk
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
 
-      - name: Deploy to Dev
+      - name: Install CDK dependencies
+        run: npm ci
+
+      - name: Deploy CDK Stack
         run: |
-          cd ecs-cdk
-          npm ci
-          npx cdk deploy --context env=dev --context imageTag=${{ github.sha }} --require-approval never
+          npx cdk deploy \
+            --context env=dev \
+            --context imageTag=${{ github.sha }} \
+            --require-approval never \
+            --require-approval broadening
+
+      - name: Verify deployment
+        run: |
+          SERVICE_URL=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.CDK_STACK }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`ServiceURL`].OutputValue' \
+            --output text)
+          echo "Service URL: $SERVICE_URL"
+          curl -sf $SERVICE_URL/health || exit 1
