@@ -1,0 +1,1341 @@
+import { createSlice, createAsyncThunk } from '@reduxjs/toolkit';
+
+import appSettings from '../../config/settings';
+import { isEmpty, pickBy } from '../../util/common';
+import { types as sdkTypes, file as sdkFile, createImageVariantConfig } from '../../util/sdkLoader';
+import {
+  bookingTimeUnits,
+  findNextBoundary,
+  getStartOf,
+  monthIdString,
+  stringifyDateToISO8601,
+} from '../../util/dates';
+import { isTransactionsTransitionInvalidTransition, storableError } from '../../util/errors';
+import { transactionLineItems, transitionPrivileged } from '../../util/api';
+import * as log from '../../util/log';
+import {
+  updatedEntities,
+  denormalisedEntities,
+  denormalisedResponseEntities,
+} from '../../util/data';
+import {
+  resolveLatestProcessName,
+  getProcess,
+  isBookingProcess,
+  isNegotiationProcess,
+} from '../../transactions/transaction';
+import { MAX_FILE_SIZE, messageHasPendingFiles } from '../../util/fileHelpers';
+
+import { addMarketplaceEntities } from '../../ducks/marketplaceData.duck';
+import { fetchCurrentUserNotifications } from '../../ducks/user.duck';
+
+const { UUID } = sdkTypes;
+
+const MESSAGES_PAGE_SIZE = 100;
+const REVIEW_TX_INCLUDES = ['reviews', 'reviews.author', 'reviews.subject'];
+const MINUTE_IN_MS = 1000 * 60;
+const POLL_MAX_ATTEMPTS = 30;
+const POLL_INTERVAL_MS = 1000;
+
+export const MAX_FILE_UPLOAD_COUNT = 10;
+
+// Day-based time slots queries are cached for 1 minute.
+const removeOutdatedDateData = timeSlotsForDate => {
+  const now = new Date().getTime();
+  const minuteAgo = now - MINUTE_IN_MS;
+  return Object.fromEntries(
+    Object.entries(timeSlotsForDate).filter(([dateId, data]) => {
+      return data.fetchedAt && data.fetchedAt > minuteAgo;
+    })
+  );
+};
+
+// Helper to fetch correct image variants for different thunk calls
+const getImageVariants = listingImageConfig => {
+  const { aspectWidth = 1, aspectHeight = 1, variantPrefix = 'listing-card' } = listingImageConfig;
+  const aspectRatio = aspectHeight / aspectWidth;
+  return {
+    'fields.image': [
+      // Profile images
+      'variants.square-small',
+      'variants.square-small2x',
+
+      // Listing images:
+      `variants.${variantPrefix}`,
+      `variants.${variantPrefix}-2x`,
+    ],
+    ...createImageVariantConfig(`${variantPrefix}`, 400, aspectRatio),
+    ...createImageVariantConfig(`${variantPrefix}-2x`, 800, aspectRatio),
+  };
+};
+
+const delay = ms => new Promise(resolve => window.setTimeout(resolve, ms));
+const refreshTx = (sdk, txId) => sdk.transactions.show({ id: txId }, { expand: true });
+const refreshTransactionEntity = (sdk, txId, dispatch) => {
+  delay(3000)
+    .then(() => refreshTx(sdk, txId))
+    .then(response => {
+      dispatch(addMarketplaceEntities(response));
+      const lastTransition = response?.data?.data?.attributes?.lastTransition;
+      // We'll make another attempt if mark-received-from-purchased from default-purchase process is still the latest.
+      if (lastTransition === 'transition/mark-received-from-purchased') {
+        return delay(8000)
+          .then(() => refreshTx(sdk, txId))
+          .then(response => {
+            dispatch(addMarketplaceEntities(response));
+          });
+      }
+    })
+    .catch(e => {
+      // refresh failed, but we don't act upon it.
+      console.log('error', e); // eslint-disable-line no-console
+    });
+};
+
+const getNextPollingDelay = delayMs => {
+  return delayMs * 2 > MINUTE_IN_MS ? MINUTE_IN_MS : delayMs * 2;
+};
+
+// ================ Async Thunks ================ //
+
+////////////////////
+// fetchTimeSlots //
+////////////////////
+const fetchTimeSlotsPayloadCreator = (
+  { listingId, start, end, timeZone, options },
+  { rejectWithValue, extra: sdk, getState }
+) => {
+  const { extraQueryParams = null, useFetchTimeSlotsForDate = false } = options || {};
+
+  // The maximum pagination page size for timeSlots is 500
+  const extraParams = extraQueryParams || {
+    perPage: 500,
+    page: 1,
+  };
+
+  // For small time units, we fetch the data per date.
+  // This is to avoid fetching too much data (with 15 minute intervals, there can be 24*4*31 = 2928 time slots)
+  if (useFetchTimeSlotsForDate) {
+    const dateId = stringifyDateToISO8601(start, timeZone);
+    const dateData = getState().TransactionPage.timeSlotsForDate[dateId];
+    const minuteAgo = new Date().getTime() - MINUTE_IN_MS;
+    const hasRecentlyFetchedData = dateData?.fetchedAt > minuteAgo;
+    if (hasRecentlyFetchedData) {
+      return Promise.resolve({ timeSlots: dateData?.timeSlots || [], dateId, type: 'date' });
+    }
+
+    return sdk.timeslots
+      .query({ listingId, start, end, ...extraParams })
+      .then(response => {
+        const timeSlots = denormalisedResponseEntities(response);
+        return { timeSlots, dateId, type: 'date' };
+      })
+      .catch(e => {
+        return rejectWithValue({ error: storableError(e), dateId, type: 'date' });
+      });
+  } else {
+    const monthId = monthIdString(start, timeZone);
+    return sdk.timeslots
+      .query({ listingId, start, end, ...extraParams })
+      .then(response => {
+        const timeSlots = denormalisedResponseEntities(response);
+        return { timeSlots, monthId, type: 'month' };
+      })
+      .catch(e => {
+        return rejectWithValue({ error: storableError(e), monthId, type: 'month' });
+      });
+  }
+};
+
+export const fetchTimeSlotsThunk = createAsyncThunk(
+  'TransactionPage/fetchTimeSlots',
+  fetchTimeSlotsPayloadCreator
+);
+
+// Backward compatible wrapper for fetchTimeSlots
+export const fetchTimeSlots = (listingId, start, end, timeZone, options) => dispatch => {
+  return dispatch(fetchTimeSlotsThunk({ listingId, start, end, timeZone, options }));
+};
+
+//////////////////////
+// fetchTransaction //
+//////////////////////
+
+// Helper function for loadData call.
+const fetchMonthlyTimeSlots = (dispatch, listing) => {
+  const hasWindow = typeof window !== 'undefined';
+  const { availabilityPlan, publicData } = listing?.attributes || {};
+  const tz = availabilityPlan?.timezone;
+
+  // Fetch time-zones on client side only.
+  if (hasWindow && listing.id && !!tz) {
+    const { unitType, priceVariants, startTimeInterval } = publicData || {};
+    const now = new Date();
+    const startOfToday = getStartOf(now, 'day', tz);
+    const isFixed = unitType === 'fixed';
+
+    const timeUnit = startTimeInterval
+      ? bookingTimeUnits[startTimeInterval]?.timeUnit
+      : unitType === 'hour'
+      ? 'hour'
+      : 'day';
+    const nextBoundary = findNextBoundary(now, 1, timeUnit, tz);
+
+    const nextMonth = getStartOf(nextBoundary, 'month', tz, 1, 'months');
+    const nextAfterNextMonth = getStartOf(nextMonth, 'month', tz, 1, 'months');
+
+    const variants = priceVariants || [];
+    const bookingLengthInMinutes = variants.reduce((min, priceVariant) => {
+      return Math.min(min, priceVariant.bookingLengthInMinutes);
+    }, Number.MAX_SAFE_INTEGER);
+
+    const nextMonthEnd = isFixed
+      ? getStartOf(nextMonth, 'minute', tz, bookingLengthInMinutes, 'minutes')
+      : nextMonth;
+    const followingMonthEnd = isFixed
+      ? getStartOf(nextAfterNextMonth, 'minute', tz, bookingLengthInMinutes, 'minutes')
+      : nextAfterNextMonth;
+
+    const minDurationStartingInInterval = isFixed ? bookingLengthInMinutes : 60;
+
+    const options = intervalAlign => {
+      return ['fixed', 'hour'].includes(unitType)
+        ? {
+            extraQueryParams: {
+              intervalDuration: 'P1D',
+              intervalAlign,
+              maxPerInterval: 1,
+              minDurationStartingInInterval,
+              perPage: 31,
+              page: 1,
+            },
+          }
+        : null;
+    };
+
+    return Promise.all([
+      dispatch(
+        fetchTimeSlotsThunk({
+          listingId: listing.id,
+          start: nextBoundary,
+          end: nextMonthEnd,
+          timeZone: tz,
+          options: options(startOfToday),
+        })
+      ),
+      dispatch(
+        fetchTimeSlotsThunk({
+          listingId: listing.id,
+          start: nextMonth,
+          end: followingMonthEnd,
+          timeZone: tz,
+          options: options(nextMonth),
+        })
+      ),
+    ]);
+  }
+
+  // By default return an empty array
+  return Promise.all([]);
+};
+
+// fetchTransaction
+const fetchTransactionPayloadCreator = (
+  { id, txRole, config },
+  { dispatch, rejectWithValue, extra: sdk }
+) => {
+  const listingRelationship = txResponse => {
+    return txResponse.data.data.relationships.listing.data;
+  };
+
+  return sdk.transactions
+    .show(
+      {
+        id,
+        include: [
+          'customer',
+          'customer.profileImage',
+          'provider',
+          'provider.profileImage',
+          'listing',
+          'listing.currentStock',
+          'listing.images',
+          'listing.author',
+          'listing.author.profileImage',
+          'booking',
+          'reviews',
+          'reviews.author',
+          'reviews.subject',
+        ],
+        ...getImageVariants(config.layout.listingImage),
+      },
+      { expand: true }
+    )
+    .then(response => {
+      const listingId = listingRelationship(response).id;
+      const entities = updatedEntities({}, response.data);
+      const listingRef = { id: listingId, type: 'listing' };
+      const transactionRef = { id, type: 'transaction' };
+      const denormalised = denormalisedEntities(entities, [listingRef, transactionRef]);
+      const listing = denormalised[0];
+      const transaction = denormalised[1];
+      const processName = resolveLatestProcessName(transaction.attributes.processName);
+
+      try {
+        const process = getProcess(processName);
+        const isInquiry = process.getState(transaction) === process.states.INQUIRY;
+
+        // Fetch time slots for transactions that are in inquired state
+        const canFetchTimeslots =
+          txRole === 'customer' && isBookingProcess(processName) && isInquiry;
+
+        if (canFetchTimeslots) {
+          fetchMonthlyTimeSlots(dispatch, listing);
+        }
+      } catch (error) {
+        if (appSettings.dev) {
+          // eslint-disable-next-line no-console
+          console.log(`transaction process (${processName}) was not recognized`);
+        }
+      }
+
+      return response;
+    })
+    .then(response => {
+      const listingFields = config?.listing?.listingFields;
+      const sanitizeConfig = { listingFields };
+
+      dispatch(addMarketplaceEntities(response, sanitizeConfig));
+      return response;
+    })
+    .catch(e => {
+      return rejectWithValue(storableError(e));
+    });
+};
+
+export const fetchTransactionThunk = createAsyncThunk(
+  'TransactionPage/fetchTransaction',
+  fetchTransactionPayloadCreator
+);
+
+// Backward compatible wrapper for fetchTransaction
+export const fetchTransaction = (id, txRole, config) => dispatch => {
+  return dispatch(fetchTransactionThunk({ id, txRole, config }));
+};
+
+////////////////////
+// makeTransition //
+////////////////////
+const makeTransitionPayloadCreator = (
+  { txId, transitionName, params },
+  { dispatch, rejectWithValue, extra: sdk, getState }
+) => {
+  const transaction = getState()?.marketplaceData?.entities?.transaction?.[txId?.uuid];
+  const processName = resolveLatestProcessName(transaction?.attributes?.processName);
+  const process = getProcess(processName);
+
+  // This calls the client app's server to make a privileged transition.
+  const privilegedTransition = () =>
+    transitionPrivileged({
+      isSpeculative: false,
+      orderData: params?.orderData || {},
+      bodyParams: {
+        id: txId,
+        transition: transitionName,
+        params: {}, // NOTE: lineItems and metadata are included on the server-side.
+      },
+      queryParams: {
+        expand: true,
+      },
+    });
+  const normalTransition = () =>
+    sdk.transactions.transition({ id: txId, transition: transitionName, params }, { expand: true });
+  // Negotiation process / accept update: check if payin total has changed
+  const acceptUpdateTransition = () =>
+    sdk.transactions.show({ id: txId }, { expand: true }).then(response => {
+      const updatedTransaction = response.data.data;
+      const newPayinTotal = updatedTransaction.attributes.payinTotal.amount;
+      const oldPayinTotal = transaction.attributes.payinTotal.amount;
+
+      if (newPayinTotal !== oldPayinTotal) {
+        dispatch(addMarketplaceEntities(response));
+        throw new Error('Payin total has changed');
+      }
+      return sdk.transactions.transition(
+        { id: txId, transition: transitionName, params },
+        { expand: true }
+      );
+    });
+
+  const makeCall = process?.isPrivileged(transitionName)
+    ? privilegedTransition
+    : isNegotiationProcess(processName) && transitionName === process.transitions.ACCEPT_UPDATE
+    ? acceptUpdateTransition
+    : normalTransition;
+
+  return makeCall()
+    .then(response => {
+      dispatch(addMarketplaceEntities(response));
+      dispatch(fetchCurrentUserNotifications());
+
+      // There could be automatic transitions after this transition
+      // For example mark-received-from-purchased > auto-complete.
+      // Here, we make 1-2 delayed updates for the tx entity.
+      // This way "leave a review" link should show up for the customer.
+      refreshTransactionEntity(sdk, txId, dispatch);
+
+      return response;
+    })
+    .catch(e => {
+      if (e.message !== 'Payin total has changed') {
+        log.error(e, `${transitionName}-failed`, {
+          txId,
+          transition: transitionName,
+        });
+      }
+      return rejectWithValue(storableError(e));
+    });
+};
+
+export const makeTransitionThunk = createAsyncThunk(
+  'TransactionPage/makeTransition',
+  makeTransitionPayloadCreator,
+  {
+    condition: ({ txId, transitionName, params }, { getState }) => {
+      const state = getState();
+      if (state.TransactionPage.transitionInProgress) {
+        return false; // Don't execute the thunk if transition is already in progress
+      }
+      return true; // Execute the thunk
+    },
+  }
+);
+
+// Backward compatible wrapper for makeTransition
+export const makeTransition = (txId, transitionName, params) => dispatch => {
+  return dispatch(makeTransitionThunk({ txId, transitionName, params }));
+};
+
+////////////////////
+// Fetch Messages //
+////////////////////
+const fetchMessagesPayloadCreator = (
+  { txId, page, config },
+  { dispatch, rejectWithValue, extra: sdk }
+) => {
+  const paging = { page, perPage: MESSAGES_PAGE_SIZE };
+
+  return sdk.messages
+    .query({
+      transaction_id: txId,
+      include: [
+        'sender',
+        'sender.profileImage',
+        'publicFileAttachments',
+        'publicFileAttachments.file',
+      ],
+      ...getImageVariants(config.layout.listingImage),
+      ...paging,
+    })
+    .then(response => {
+      const messages = denormalisedResponseEntities(response);
+      const { totalItems, totalPages, page: fetchedPage } = response.data.meta;
+      const pagination = { totalItems, totalPages, page: fetchedPage };
+
+      // Check if totalItems has changed between fetched pagination pages
+      // if totalItems has changed, fetch first page again to include new incoming messages.
+      // TODO if there're more than 100 incoming messages,
+      // this should loop through most recent pages instead of fetching just the first one.
+      if (totalItems > 0 && page > 1) {
+        // Background update for new incoming messages
+        dispatch(fetchMessagesThunk({ txId, page: 1, config })).catch(() => {
+          // Background update, no need to to do anything atm.
+        });
+      }
+
+      const messagesWithPendingFiles = messages.filter(messageHasPendingFiles);
+      messagesWithPendingFiles.forEach(m =>
+        dispatch(pollForMessageFileVerification(m.id.uuid, txId))
+      );
+
+      return { messages, pagination };
+    })
+    .catch(e => {
+      return rejectWithValue(storableError(e));
+    });
+};
+
+export const fetchMessagesThunk = createAsyncThunk(
+  'TransactionPage/fetchMessages',
+  fetchMessagesPayloadCreator
+);
+
+// Backward compatible wrapper for fetchMessages
+export const fetchMessages = (txId, page, config) => dispatch => {
+  return dispatch(fetchMessagesThunk({ txId, page, config }));
+};
+
+export const fetchMoreMessages = (txId, config) => (dispatch, getState, sdk) => {
+  const state = getState();
+  const { oldestMessagePageFetched, totalMessagePages } = state.TransactionPage;
+  const hasMoreOldMessages = totalMessagePages > oldestMessagePageFetched;
+
+  // In case there're no more old pages left we default to fetching the current cursor position
+  const nextPage = hasMoreOldMessages ? oldestMessagePageFetched + 1 : oldestMessagePageFetched;
+
+  return dispatch(fetchMessagesThunk({ txId, page: nextPage, config }));
+};
+
+////////////////////////////////
+// Poll For File Verification //
+////////////////////////////////
+
+const pollForFileVerificationPayloadCreator = (
+  { fileId, tempId },
+  { dispatch, rejectWithValue, extra: sdk, getState }
+) => {
+  const poll = (attempt, delayMs) => {
+    const fileExists = getState().TransactionPage.fileUploads[tempId];
+
+    if (!fileExists) {
+      return { tempId, sent: true };
+    }
+
+    return sdk.ownFiles.show({ id: fileId }).then(resp => {
+      const fileState = resp?.data?.data?.attributes?.state;
+      dispatch(setVerificationStatus({ tempId, verificationStatus: fileState }));
+
+      if (fileState === 'available') {
+        const [fileUpload] = denormalisedResponseEntities(resp);
+        return { fileUpload, tempId };
+      }
+
+      if (fileState === 'verificationFailed') {
+        const [fileUpload] = denormalisedResponseEntities(resp);
+        return rejectWithValue({ tempId, message: 'verificationFailed', fileUpload });
+      }
+
+      if (attempt >= POLL_MAX_ATTEMPTS - 1) {
+        return rejectWithValue({ tempId, message: 'timeout' });
+      }
+
+      return delay(delayMs).then(() => poll(attempt + 1, getNextPollingDelay(delayMs)));
+    });
+  };
+
+  // Wrap poll in a promise to ensure an error is always
+  // thrown asynchronously
+  return Promise.resolve()
+    .then(() => poll(0, POLL_INTERVAL_MS))
+    .catch(e => rejectWithValue({ tempId, error: storableError(e) }));
+};
+
+export const pollForFileVerificationThunk = createAsyncThunk(
+  'TransactionPage/pollForFileVerification',
+  pollForFileVerificationPayloadCreator
+);
+
+export const pollForFileVerification = (fileId, tempId) => dispatch => {
+  return dispatch(pollForFileVerificationThunk({ fileId, tempId }));
+};
+
+////////////////////
+// Upload File    //
+////////////////////
+
+const uploadFilePayloadCreator = (
+  { file, tempId },
+  { dispatch, rejectWithValue, extra: sdk, getState }
+) => {
+  let fileId;
+
+  ///////////////////////////////////
+  /// Step 1. Check file metadata ///
+  ///////////////////////////////////
+  const checkMetadataFn = file => {
+    if (!file) {
+      throw new Error('Missing file, cannot initiate upload.');
+    }
+
+    if (Object.keys(getState().TransactionPage.fileUploads).length > MAX_FILE_UPLOAD_COUNT) {
+      throw new Error('Upload file count exceeded, cannot initiate upload.');
+    }
+
+    // Currently the MAX_FILE_SIZE value corresponds to the max file size permitted
+    // by the API. If you want to reduce the permitted file size further, you can modify
+    // the size parameter, and if you want to get the size validation from the
+    // sdk.ownFiles.create() endpoint, you can remove this condition completely.
+    if (file.size > MAX_FILE_SIZE) {
+      throw new Error('maxFileSizeExceeded', file);
+    }
+
+    return sdkFile.metadata(file);
+  };
+
+  ////////////////////////////////////
+  /// Step 2. Create file resource ///
+  ////////////////////////////////////
+  const createFileResourceFn = metadataResp => {
+    return sdk.ownFiles.create({ ...metadataResp }).catch(e => {
+      const isMimeTypeError = e.data.errors.some(
+        e => e.status === 400 && e.source.path.some(p => p === 'mimeType')
+      );
+      if (isMimeTypeError) {
+        throw new Error('mimeTypeError');
+      } else {
+        throw e;
+      }
+    });
+  };
+
+  //////////////////////////////////////////
+  /// Step 3. Create URL for file upload ///
+  //////////////////////////////////////////
+  const createFileUploadUrlFn = ownFileResp => {
+    const createdFileId = ownFileResp?.data?.data?.id;
+    if (!createdFileId) {
+      throw new Error('Missing fileId, cannot get upload URL');
+    }
+
+    fileId = createdFileId;
+    return sdk.fileUploads.create({ fileId: createdFileId });
+  };
+
+  ///////////////////////////////////////////////
+  /// Step 4. Upload file directly to storage ///
+  ///////////////////////////////////////////////
+  const uploadFileToStorageFn = fileUploadResp => {
+    const { method = 'PUT', url, headers = {} } = fileUploadResp?.data?.data?.attributes;
+
+    if (!url) {
+      throw new Error('Missing upload URL, cannot upload file.');
+    }
+
+    const onUploadProgress = progressEvent => {
+      const loaded = progressEvent?.loaded || 0;
+      const total = progressEvent?.total || file.size;
+      const progress = total ? Math.min(100, Math.round((loaded / total) * 100)) : null;
+      dispatch(setUploadProgress({ tempId, progress }));
+    };
+
+    return sdkFile.upload({
+      method,
+      url,
+      headers,
+      file,
+      onUploadProgress,
+    });
+  };
+
+  //////////////////////////////////////////////
+  /// Step 5. Return ids for future handling ///
+  //////////////////////////////////////////////
+
+  const handleFileUploadSuccessFn = () => {
+    return sdk.ownFiles.show({ id: fileId }).then(resp => {
+      const denormalisedResponse = denormalisedResponseEntities(resp);
+      const fileUpload = denormalisedResponse[0];
+      return { fileUpload, tempId };
+    });
+  };
+
+  const applyAsync = (acc, val) => acc.then(val);
+  const composeAsync = (...funcs) => x => funcs.reduce(applyAsync, Promise.resolve(x));
+
+  const handleFileUpload = composeAsync(
+    checkMetadataFn,
+    createFileResourceFn,
+    createFileUploadUrlFn,
+    uploadFileToStorageFn,
+    handleFileUploadSuccessFn
+  );
+
+  return handleFileUpload(file)
+    .then(resp => {
+      dispatch(pollForFileVerificationThunk({ fileId, tempId }));
+      return resp;
+    })
+    .catch(e => {
+      return rejectWithValue({ tempId, error: storableError(e) });
+    });
+};
+
+export const uploadFileThunk = createAsyncThunk(
+  'TransactionPage/uploadFile',
+  uploadFilePayloadCreator
+);
+
+// Backward-compatible wrapper
+export const uploadFile = (file, tempId) => dispatch => {
+  return dispatch(uploadFileThunk({ file, tempId }));
+};
+
+///////////////////////////////////////////
+// Poll For Message File Verification   //
+///////////////////////////////////////////
+
+const pollForMessageFileVerificationPayloadCreator = (
+  { messageId, txId },
+  { dispatch, rejectWithValue, extra: sdk }
+) => {
+  const poll = (attempt, delayMs) => {
+    if (document.hidden) {
+      // If the user is on another browser tab or window,
+      // skip the SDK poll and don't increment the delay
+      return delay(delayMs).then(() => poll(attempt + 1, delayMs));
+    }
+    return sdk.messages
+      .query({
+        transactionId: txId,
+        ids: [messageId],
+        include: ['publicFileAttachments', 'publicFileAttachments.file'],
+      })
+      .then(resp => {
+        const message = denormalisedResponseEntities(resp)[0];
+        if (!message) {
+          return rejectWithValue({ messageId, reason: 'messageNotFound' });
+        }
+
+        const hasPendingFiles = messageHasPendingFiles(message);
+
+        dispatch(setMessageFileVerificationStatus({ message }));
+
+        if (!hasPendingFiles) {
+          return { messageId };
+        }
+
+        if (attempt >= POLL_MAX_ATTEMPTS - 1) {
+          return rejectWithValue({ messageId, reason: 'timeout' });
+        }
+
+        return delay(delayMs).then(() => poll(attempt + 1, getNextPollingDelay(delayMs)));
+      });
+  };
+
+  return Promise.resolve()
+    .then(() => poll(0, POLL_INTERVAL_MS))
+    .catch(e => rejectWithValue({ messageId, error: storableError(e) }));
+};
+
+export const pollForMessageFileVerificationThunk = createAsyncThunk(
+  'TransactionPage/pollForMessageFileVerification',
+  pollForMessageFileVerificationPayloadCreator,
+  {
+    condition: ({ messageId }, { getState }) =>
+      !getState().TransactionPage.messageFilePolling[messageId]?.inProgress,
+  }
+);
+
+export const pollForMessageFileVerification = (messageId, txId) => dispatch => {
+  return dispatch(pollForMessageFileVerificationThunk({ messageId, txId }));
+};
+
+////////////////////
+// downloadFile   //
+////////////////////
+const downloadFilePayloadCreator = (
+  { fileAttachmentId, isOwnFile },
+  { rejectWithValue, extra: sdk }
+) => {
+  if (!fileAttachmentId) {
+    return Promise.resolve(
+      rejectWithValue({
+        fileAttachmentId,
+        error: storableError(new Error('Missing fileAttachmentId, cannot initiate download.')),
+      })
+    );
+  }
+  // Request a temporary download URL from the SDK
+  const downLoadFn = isOwnFile
+    ? sdk.ownFileDownloads.create({ fileId: fileAttachmentId })
+    : sdk.fileDownloads.create({ fileAttachmentId });
+  return downLoadFn
+    .then(downloadResp => {
+      // Trigger a browser file download
+      const { url } = downloadResp?.data?.data?.attributes || {};
+      if (!url) {
+        throw new Error('Missing download URL, cannot trigger file download.');
+      }
+
+      window.open(url, '_blank', 'noopener,noreferrer');
+      return fileAttachmentId;
+    })
+    .catch(e => {
+      return rejectWithValue({ fileAttachmentId, error: storableError(e) });
+    });
+};
+
+export const downloadFileThunk = createAsyncThunk(
+  'TransactionPage/downloadFile',
+  downloadFilePayloadCreator
+);
+
+// Backward-compatible wrapper — mirrors uploadFile pattern
+export const downloadFile = (fileAttachmentId, isOwnFile = false) => dispatch => {
+  return dispatch(downloadFileThunk({ fileAttachmentId, isOwnFile })).unwrap();
+};
+/////////////////
+// sendMessage //
+/////////////////
+const sendMessagePayloadCreator = (
+  { txId, message, config, fileIds },
+  { dispatch, rejectWithValue, extra: sdk }
+) => {
+  return sdk.messages
+    .send({ transactionId: txId, content: message, publicFileAttachments: fileIds })
+    .then(response => {
+      const messageId = response.data.data.id;
+
+      // We fetch the first page again to add sent message to the page data
+      // and update possible incoming messages too.
+      return dispatch(fetchMessagesThunk({ txId, page: 1, config }))
+        .then(() => messageId)
+        .catch(() => messageId);
+    })
+    .catch(e => {
+      return rejectWithValue(storableError(e));
+    });
+};
+
+export const sendMessageThunk = createAsyncThunk(
+  'TransactionPage/sendMessage',
+  sendMessagePayloadCreator
+);
+
+// Backward compatible wrapper for sendMessage
+export const sendMessage = (txId, message, config, fileIds = null) => dispatch => {
+  return dispatch(sendMessageThunk({ txId, message, config, fileIds }));
+};
+
+////////////////
+// sendReview //
+////////////////
+const sendReviewPayloadCreator = (
+  { tx, transitionOptionsInfo, params, config },
+  { dispatch, rejectWithValue, extra: sdk }
+) => {
+  const { reviewAsFirst, reviewAsSecond, hasOtherPartyReviewedFirst } = transitionOptionsInfo;
+  const include = REVIEW_TX_INCLUDES;
+
+  const sendReviewAsSecond = () => {
+    return sdk.transactions
+      .transition(
+        { id: tx?.id, transition: reviewAsSecond, params },
+        { expand: true, include, ...getImageVariants(config.layout.listingImage) }
+      )
+      .then(response => {
+        dispatch(addMarketplaceEntities(response));
+        return response;
+      })
+      .catch(e => {
+        return rejectWithValue(storableError(e));
+      });
+  };
+
+  const sendReviewAsFirst = () => {
+    return sdk.transactions
+      .transition(
+        { id: tx?.id, transition: reviewAsFirst, params },
+        { expand: true, include, ...getImageVariants(config.layout.listingImage) }
+      )
+      .then(response => {
+        dispatch(addMarketplaceEntities(response));
+        return response;
+      })
+      .catch(e => {
+        // If transaction transition is invalid, lets try another endpoint.
+        if (isTransactionsTransitionInvalidTransition(e)) {
+          return sendReviewAsSecond();
+        } else {
+          return rejectWithValue(storableError(e));
+        }
+      });
+  };
+
+  return hasOtherPartyReviewedFirst ? sendReviewAsSecond() : sendReviewAsFirst();
+};
+
+export const sendReviewThunk = createAsyncThunk(
+  'TransactionPage/sendReview',
+  sendReviewPayloadCreator
+);
+
+// Backward compatible wrapper for sendReview
+export const sendReview = (tx, transitionOptionsInfo, params, config) => dispatch => {
+  return dispatch(sendReviewThunk({ tx, transitionOptionsInfo, params, config }));
+};
+
+//////////////////////
+// fetchTransitions //
+//////////////////////
+const fetchTransitionsPayloadCreator = ({ id }, { rejectWithValue, extra: sdk }) => {
+  return sdk.processTransitions
+    .query({ transactionId: id })
+    .then(res => res.data.data)
+    .catch(e => {
+      return rejectWithValue(storableError(e));
+    });
+};
+
+export const fetchTransitionsThunk = createAsyncThunk(
+  'TransactionPage/fetchTransitions',
+  fetchTransitionsPayloadCreator
+);
+
+// Backward compatible wrapper for fetchTransitions
+export const fetchNextTransitions = id => dispatch => {
+  return dispatch(fetchTransitionsThunk({ id }));
+};
+
+////////////////////
+// FetchLineItems //
+////////////////////
+const fetchLineItemsPayloadCreator = (
+  { orderData, listingId, isOwnListing },
+  { rejectWithValue }
+) => {
+  return transactionLineItems({ orderData, listingId, isOwnListing })
+    .then(response => response.data)
+    .catch(e => {
+      log.error(e, 'fetching-line-items-failed', {
+        listingId: listingId.uuid,
+        orderData,
+        statusText: e.statusText,
+      });
+      return rejectWithValue(storableError(e));
+    });
+};
+
+export const fetchLineItemsThunk = createAsyncThunk(
+  'TransactionPage/fetchLineItems',
+  fetchLineItemsPayloadCreator
+);
+
+// Backward compatible wrapper for fetchLineItems
+export const fetchTransactionLineItems = ({ orderData, listingId, isOwnListing }) => dispatch => {
+  return dispatch(fetchLineItemsThunk({ orderData, listingId, isOwnListing }));
+};
+
+// ================ Slice ================ //
+
+const initialState = {
+  fetchTransactionInProgress: false,
+  fetchTransactionError: null,
+  transactionRef: null,
+  transitionInProgress: null,
+  transitionError: null,
+  fetchMessagesInProgress: false,
+  fetchMessagesError: null,
+  totalMessages: 0,
+  totalMessagePages: 0,
+  oldestMessagePageFetched: 0,
+  messages: [],
+  savePaymentMethodFailed: false,
+  sendMessageInProgress: false,
+  sendMessageError: null,
+  sendReviewInProgress: false,
+  sendReviewError: null,
+  monthlyTimeSlots: {
+    // '2022-03': {
+    //   timeSlots: [],
+    //   fetchTimeSlotsError: null,
+    //   fetchTimeSlotsInProgress: null,
+    // },
+  },
+  timeSlotsForDate: {
+    // For small time units, we fetch monthly time slots with sparse mode for calendar view
+    // and when the user clicks on a day, we make a full time slot query. This is for that purpose.
+    // '2025-02-03': {
+    //   timeSlots: [],
+    //   fetchedAt: 1738569600000,
+    //   fetchTimeSlotsError: null,
+    //   fetchTimeSlotsInProgress: null,
+    // },
+  },
+  fetchTransitionsInProgress: false,
+  fetchTransitionsError: null,
+  processTransitions: null,
+  lineItems: null,
+  fetchLineItemsInProgress: false,
+  fetchLineItemsError: null,
+  fileUploads: {
+    // [tempId]: {
+    // uploadInProgress: bool,
+    // verificationInProgress: bool,
+    // error: null | storable-error,
+    // file: null | SKD file,
+    // sourceFile: null | File
+    // progress: null | number,
+    // verificationStatus: null | string,
+    // tempId,
+    // }
+  },
+  // This is configured by default in Access control. If a marketplace
+  // operator disables file uploads when a user is uploading a file,
+  // store the information in state and use it to view the necessary information
+  // if the configuration still has old access details.
+  fileUploadsDisabled: false,
+  fileDownloads: {
+    // [fileId.uuid]: { inProgress: bool, error: null | storable-error }
+  },
+  messageFilePolling: {
+    // [messageId]: { inProgress: bool, error: null | storable-error }
+  },
+};
+
+// Merge entity arrays using ids, so that conflicting items in newer array (b) overwrite old values (a).
+// const a = [{ id: { uuid: 1 } }, { id: { uuid: 3 } }];
+// const b = [{ id: : { uuid: 2 } }, { id: : { uuid: 1 } }];
+// mergeEntityArrays(a, b)
+// => [{ id: { uuid: 3 } }, { id: : { uuid: 2 } }, { id: : { uuid: 1 } }]
+const mergeEntityArrays = (a, b) => {
+  return a.filter(aEntity => !b.find(bEntity => aEntity.id.uuid === bEntity.id.uuid)).concat(b);
+};
+
+const transactionPageSlice = createSlice({
+  name: 'TransactionPage',
+  initialState,
+  reducers: {
+    setInitialValues: (state, action) => {
+      return { ...initialState, ...action.payload };
+    },
+    clearUploadedFiles: (state, action) => {
+      action.payload.forEach(tempId => {
+        delete state.fileUploads[tempId];
+      });
+    },
+    setUploadProgress: (state, action) => {
+      const { tempId, progress } = action.payload;
+      if (state.fileUploads[tempId]) {
+        state.fileUploads[tempId].progress = progress;
+      }
+    },
+    setVerificationStatus: (state, action) => {
+      const { tempId, verificationStatus } = action.payload;
+      if (state.fileUploads[tempId]) {
+        state.fileUploads[tempId].verificationStatus = verificationStatus;
+        state.fileUploads[tempId].uploadInProgress = verificationStatus === 'pendingUpload';
+        state.fileUploads[tempId].verificationInProgress =
+          verificationStatus === 'pendingVerification';
+      }
+    },
+    setMessageFileVerificationStatus: (state, action) => {
+      const { message } = action.payload;
+      const stateMessage = state.messages.find(m => m.id.uuid === message.id.uuid);
+      if (stateMessage && stateMessage.publicFileAttachments) {
+        stateMessage.publicFileAttachments = message.publicFileAttachments;
+      }
+    },
+  },
+  extraReducers: builder => {
+    builder
+      // fetchTransaction cases
+      .addCase(fetchTransactionThunk.pending, state => {
+        state.fetchTransactionInProgress = true;
+        state.fetchTransactionError = null;
+      })
+      .addCase(fetchTransactionThunk.fulfilled, (state, action) => {
+        state.fetchTransactionInProgress = false;
+        state.transactionRef = { id: action.payload.data.data.id, type: 'transaction' };
+      })
+      .addCase(fetchTransactionThunk.rejected, (state, action) => {
+        state.fetchTransactionInProgress = false;
+        state.fetchTransactionError = action.payload;
+      })
+      // fetchTransitions cases
+      .addCase(fetchTransitionsThunk.pending, state => {
+        state.fetchTransitionsInProgress = true;
+        state.fetchTransitionsError = null;
+      })
+      .addCase(fetchTransitionsThunk.fulfilled, (state, action) => {
+        state.fetchTransitionsInProgress = false;
+        state.processTransitions = action.payload;
+      })
+      .addCase(fetchTransitionsThunk.rejected, (state, action) => {
+        state.fetchTransitionsInProgress = false;
+        state.fetchTransitionsError = action.payload;
+      })
+      // makeTransition cases
+      .addCase(makeTransitionThunk.pending, (state, action) => {
+        state.transitionInProgress = action.meta.arg.transitionName;
+        state.transitionError = null;
+      })
+      .addCase(makeTransitionThunk.fulfilled, state => {
+        state.transitionInProgress = null;
+      })
+      .addCase(makeTransitionThunk.rejected, (state, action) => {
+        state.transitionInProgress = null;
+        state.transitionError = action.payload;
+      })
+      // fetchMessages cases
+      .addCase(fetchMessagesThunk.pending, state => {
+        state.fetchMessagesInProgress = true;
+        state.fetchMessagesError = null;
+      })
+      .addCase(fetchMessagesThunk.fulfilled, (state, action) => {
+        const { messages, pagination } = action.payload;
+        const oldestMessagePageFetched =
+          state.oldestMessagePageFetched > pagination.page
+            ? state.oldestMessagePageFetched
+            : pagination.page;
+
+        state.fetchMessagesInProgress = false;
+        state.messages = mergeEntityArrays(state.messages, messages);
+        state.totalMessages = pagination.totalItems;
+        state.totalMessagePages = pagination.totalPages;
+        state.oldestMessagePageFetched = oldestMessagePageFetched;
+      })
+      .addCase(fetchMessagesThunk.rejected, (state, action) => {
+        state.fetchMessagesInProgress = false;
+        state.fetchMessagesError = action.payload;
+      })
+      // sendMessage cases
+      .addCase(sendMessageThunk.pending, state => {
+        state.sendMessageInProgress = true;
+        state.sendMessageError = null;
+      })
+      .addCase(sendMessageThunk.fulfilled, state => {
+        state.sendMessageInProgress = false;
+      })
+      .addCase(sendMessageThunk.rejected, (state, action) => {
+        state.sendMessageInProgress = false;
+        state.sendMessageError = action.payload;
+      })
+      // sendReview cases
+      .addCase(sendReviewThunk.pending, state => {
+        state.sendReviewInProgress = true;
+        state.sendReviewError = null;
+      })
+      .addCase(sendReviewThunk.fulfilled, state => {
+        state.sendReviewInProgress = false;
+      })
+      .addCase(sendReviewThunk.rejected, (state, action) => {
+        state.sendReviewInProgress = false;
+        state.sendReviewError = action.payload;
+      })
+      // fetchLineItems cases
+      .addCase(fetchLineItemsThunk.pending, state => {
+        state.fetchLineItemsInProgress = true;
+        state.fetchLineItemsError = null;
+      })
+      .addCase(fetchLineItemsThunk.fulfilled, (state, action) => {
+        state.fetchLineItemsInProgress = false;
+        state.lineItems = action.payload;
+      })
+      .addCase(fetchLineItemsThunk.rejected, (state, action) => {
+        state.fetchLineItemsInProgress = false;
+        state.fetchLineItemsError = action.payload;
+      })
+      // uploadFile cases
+      .addCase(uploadFileThunk.pending, (state, action) => {
+        const { tempId, file } = action.meta.arg;
+        state.fileUploads[tempId] = {
+          uploadInProgress: true,
+          error: null,
+          file: null,
+          sourceFile: file, // Set source file so that other components can get the file name
+          progress: null,
+          verificationStatus: null,
+          tempId,
+        };
+      })
+      .addCase(uploadFileThunk.fulfilled, (state, action) => {
+        const { fileUpload, tempId } = action.payload;
+        if (state.fileUploads[tempId]) {
+          state.fileUploads[tempId].file = fileUpload;
+          state.fileUploads[tempId].sourceFile = null;
+        }
+      })
+      .addCase(uploadFileThunk.rejected, (state, action) => {
+        const { tempId, error } = action.payload;
+        const { file } = action.meta.arg;
+        const isFileUploadDisabledError =
+          error.status === 403 && error.apiErrors.some(ae => ae.code === 'file-upload-disabled');
+        if (isFileUploadDisabledError) {
+          state.fileUploadsDisabled = true;
+          state.fileUploads = {};
+        } else {
+          state.fileUploads[tempId] = {
+            uploadInProgress: false,
+            error,
+            file: null,
+            sourceFile: file,
+            tempId,
+          };
+        }
+      })
+      // pollForFileVerification cases
+      .addCase(pollForFileVerificationThunk.pending, (state, action) => {
+        const { tempId } = action.meta.arg;
+        if (state.fileUploads[tempId]) {
+          state.fileUploads[tempId].verificationInProgress = true;
+        }
+      })
+      .addCase(pollForFileVerificationThunk.fulfilled, (state, action) => {
+        const { tempId, fileUpload } = action?.payload;
+        if (state.fileUploads[tempId]) {
+          state.fileUploads[tempId].verificationInProgress = false;
+          state.fileUploads[tempId].file = fileUpload;
+        }
+      })
+      .addCase(pollForFileVerificationThunk.rejected, (state, action) => {
+        if (!action.payload) {
+          return;
+        }
+
+        const { tempId, message, fileUpload } = action.payload;
+        if (state.fileUploads[tempId]) {
+          state.fileUploads[tempId].verificationInProgress = false;
+          state.fileUploads[tempId].error = { message };
+          if (fileUpload) {
+            state.fileUploads[tempId].file = fileUpload;
+          }
+        }
+      })
+      // downloadFile cases
+      .addCase(downloadFileThunk.pending, (state, action) => {
+        const { fileAttachmentId } = action.meta.arg;
+        state.fileDownloads[fileAttachmentId.uuid] = {
+          inProgress: true,
+          error: null,
+        };
+      })
+      .addCase(downloadFileThunk.fulfilled, (state, action) => {
+        const fileAttachmentId = action.payload;
+        state.fileDownloads[fileAttachmentId.uuid] = {
+          inProgress: false,
+          error: null,
+        };
+      })
+      .addCase(downloadFileThunk.rejected, (state, action) => {
+        if (!action.payload) {
+          return;
+        }
+        const { fileAttachmentId, error } = action.payload;
+        state.fileDownloads[fileAttachmentId.uuid] = {
+          inProgress: false,
+          error,
+        };
+      })
+      // pollForMessageFileVerification cases
+      .addCase(pollForMessageFileVerificationThunk.pending, (state, action) => {
+        const { messageId } = action.meta.arg;
+        state.messageFilePolling[messageId] = { inProgress: true, error: null };
+      })
+      .addCase(pollForMessageFileVerificationThunk.fulfilled, (state, action) => {
+        const { messageId } = action.payload;
+        state.messageFilePolling[messageId] = { inProgress: false, error: null };
+      })
+      .addCase(pollForMessageFileVerificationThunk.rejected, (state, action) => {
+        if (!action.payload) {
+          return;
+        }
+        const { messageId, reason, error } = action.payload;
+        state.messageFilePolling[messageId] = { inProgress: false, error: error || { reason } };
+      })
+      // fetchTimeSlots cases
+      .addCase(fetchTimeSlotsThunk.pending, (state, action) => {
+        const { timeZone, options } = action.meta.arg;
+        const { useFetchTimeSlotsForDate = false } = options || {};
+
+        if (useFetchTimeSlotsForDate) {
+          const dateId = stringifyDateToISO8601(action.meta.arg.start, timeZone);
+          state.timeSlotsForDate = {
+            ...removeOutdatedDateData(state.timeSlotsForDate),
+            [dateId]: {
+              ...state.timeSlotsForDate[dateId],
+              fetchTimeSlotsError: null,
+              fetchedAt: null,
+              fetchTimeSlotsInProgress: true,
+              timeSlots: [],
+            },
+          };
+        } else {
+          const monthId = monthIdString(action.meta.arg.start, timeZone);
+          state.monthlyTimeSlots[monthId] = {
+            ...state.monthlyTimeSlots[monthId],
+            fetchTimeSlotsError: null,
+            fetchTimeSlotsInProgress: true,
+          };
+        }
+      })
+      .addCase(fetchTimeSlotsThunk.fulfilled, (state, action) => {
+        const { timeSlots, dateId, monthId, type } = action.payload;
+
+        if (type === 'date') {
+          state.timeSlotsForDate[dateId] = {
+            ...state.timeSlotsForDate[dateId],
+            fetchTimeSlotsInProgress: false,
+            fetchedAt: new Date().getTime(),
+            timeSlots,
+          };
+        } else if (type === 'month') {
+          state.monthlyTimeSlots[monthId] = {
+            ...state.monthlyTimeSlots[monthId],
+            fetchTimeSlotsInProgress: false,
+            timeSlots,
+          };
+        }
+      })
+      .addCase(fetchTimeSlotsThunk.rejected, (state, action) => {
+        const { error, dateId, monthId, type } = action.payload;
+
+        if (type === 'date') {
+          state.timeSlotsForDate[dateId] = {
+            ...state.timeSlotsForDate[dateId],
+            fetchTimeSlotsInProgress: false,
+            fetchTimeSlotsError: error,
+          };
+        } else if (type === 'month') {
+          state.monthlyTimeSlots[monthId] = {
+            ...state.monthlyTimeSlots[monthId],
+            fetchTimeSlotsInProgress: false,
+            fetchTimeSlotsError: error,
+          };
+        }
+      });
+  },
+});
+
+export const {
+  setInitialValues,
+  clearUploadedFiles,
+  setUploadProgress,
+  setVerificationStatus,
+  setMessageFileVerificationStatus,
+} = transactionPageSlice.actions;
+
+// ================ Selectors ================ //
+
+// Returns the fileUploads entries as an array, one item per selected file.
+export const selectFileUploads = state => Object.values(state.TransactionPage.fileUploads);
+
+export default transactionPageSlice.reducer;
+
+// ================ Load data ================ //
+
+const isNonEmpty = value => {
+  return typeof value === 'object' || Array.isArray(value) ? !isEmpty(value) : !!value;
+};
+
+// loadData is a collection of async calls that need to be made
+// before page has all the info it needs to render itself
+export const loadData = (params, search, config) => (dispatch, getState) => {
+  const txId = new UUID(params.id);
+  const state = getState().TransactionPage;
+  const txRef = state.transactionRef;
+  const txRole = params.transactionRole;
+
+  // In case a transaction reference is found from a previous
+  // data load -> clear the state. Otherwise keep the non-null
+  // and non-empty values which may have been set from a previous page.
+  const initialValues = txRef ? {} : pickBy(state, isNonEmpty);
+  dispatch(setInitialValues(initialValues));
+
+  // Sale / order (i.e. transaction entity in API)
+  return Promise.all([
+    dispatch(fetchTransactionThunk({ id: txId, txRole, config })),
+    dispatch(fetchMessagesThunk({ txId, page: 1, config })),
+    dispatch(fetchTransitionsThunk({ id: txId })),
+  ]);
+};

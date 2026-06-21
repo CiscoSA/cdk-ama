@@ -1,0 +1,186 @@
+@import '../../../styles/customMediaQueries.css';
+
+.root {
+  /* Layout */
+  display: flex;
+  flex-direction: column;
+  position: relative;
+
+  /* Remove link's hover effect */
+  &:hover {
+    text-decoration: none;
+  }
+}
+
+.thumbnailContainer {
+  /* Layout */
+  display: block;
+  width: 100%;
+  position: relative;
+  transition: var(--transitionStyleButton);
+
+  &:hover {
+    transform: scale(1.02);
+    box-shadow: var(--boxShadowListingCard);
+  }
+}
+
+.clickWrapperClickable {
+  cursor: pointer;
+}
+
+.info {
+  /* Layout */
+  display: flex;
+  flex-direction: column;
+  padding: 8px 0 2px 0;
+
+  @media (--viewportMedium) {
+    padding: 14px 0 2px 0;
+  }
+}
+
+.price {
+  composes: textSmall from global;
+
+  /* Layout */
+  flex-shrink: 0;
+  margin-bottom: 4px;
+  color: var(--colorGrey700);
+}
+
+.priceValue {
+  /* Font */
+  font-weight: var(--fontWeightSemiBold);
+  color: var(--marketplaceColor);
+
+  /* Remove default margins from font */
+  margin-top: 0;
+  margin-bottom: 0;
+
+  @media (--viewportMedium) {
+    margin-top: 0;
+    margin-bottom: 0;
+  }
+}
+
+.perUnit {
+  /* Font */
+  font-weight: var(--fontWeightSemiBold);
+  color: var(--marketplaceColor);
+
+  /* Remove default margins from font */
+  margin-top: 0;
+  margin-bottom: 0;
+
+  @media (--viewportMedium) {
+    margin-top: 0;
+    margin-bottom: 0;
+  }
+}
+
+.noPrice {
+  composes: perUnit;
+  padding: 5px 0 3px 0;
+}
+
+.mainInfo {
+  display: flex;
+  flex-direction: column;
+  flex-grow: 1;
+}
+
+.titleWrapper {
+  line-height: 24px;
+}
+
+.title {
+  composes: p from global;
+
+  /* Position and dimensions */
+  display: inline;
+
+  /* Borders */
+  border: none;
+
+  /* Text size should be inherited */
+  text-decoration: none;
+
+  /* Font */
+  font-weight: var(--fontWeightSemiBold);
+  line-height: 24px;
+
+  color: var(--colorGrey700);
+  text-align: left;
+
+  padding: 3px 0;
+
+  /* Remove default margins from font */
+  margin: 0;
+
+  &:hover {
+    text-decoration: underline;
+    cursor: pointer;
+  }
+
+  @media (--viewportMedium) {
+    padding: 0;
+    margin: 0;
+  }
+}
+
+.edit {
+  composes: buttonSecondary from global;
+
+  /* TODO: Odd font-size */
+  font-size: 14px;
+
+  /* Reset min-height from button styles */
+  min-height: 0;
+
+  /* Reserve space for button */
+  flex-shrink: 0;
+  width: auto;
+  height: 41px;
+  padding: 7px 14px 7px 35px;
+
+  /* Add edit icon as a background image */
+  background-image: url('data:image/svg+xml;utf8,<svg width="14" height="14" viewBox="0 0 14 14" xmlns="http://www.w3.org/2000/svg"><g stroke="%234A4A4A" fill="none" fill-rule="evenodd" stroke-linecap="round" stroke-linejoin="round"><path d="M5.307 11.155L1 13l1.846-4.308L10.54 1 13 3.46zM11 5L9 3M5 11L3 9"/></g></svg>');
+  background-repeat: no-repeat;
+  background-position: 15px center;
+}
+
+.manageLinks {
+  composes: marketplaceTinyFontStyles from global;
+  line-height: 18px;
+  padding-top: 2px;
+  padding-bottom: 4px;
+
+  /* Remove default margins from font */
+  margin-top: 0;
+  margin-bottom: 0;
+
+  @media (--viewportMedium) {
+    line-height: 24px;
+    padding-top: 0;
+    padding-bottom: 0;
+
+    margin-top: 0;
+    margin-bottom: 0;
+  }
+}
+
+.manageLink {
+  text-decoration: underline;
+  color: var(--colorGrey700);
+  white-space: pre;
+
+  &:hover {
+    text-decoration: underline;
+    color: var(--colorBlack);
+  }
+}
+
+.manageLinksSeparator {
+  margin: 0 3px 0 3px;
+}
