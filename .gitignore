@@ -3,6 +3,7 @@
 !app/src/**/*.js
 !app/scripts/**/*.js
 !app/config/**/*.js
+!app/server/**/*.js
 *.d.ts
 node_modules
 app/node_modules
