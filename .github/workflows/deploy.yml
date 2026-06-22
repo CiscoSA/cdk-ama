@@ -51,14 +51,10 @@ jobs:
       - name: Force new deployment
         if: github.event_name == 'push' && github.ref == 'refs/heads/app'
         run: |
-          CLUSTER=$(aws cloudformation describe-stacks \
-            --stack-name ${{ env.CDK_STACK }} \
-            --query 'Stacks[0].Outputs[?OutputKey==`ClusterName`].OutputValue' \
-            --output text)
-          SERVICE=$(aws cloudformation describe-stacks \
-            --stack-name ${{ env.CDK_STACK }} \
-            --query 'Stacks[0].Outputs[?OutputKey==`ServiceName`].OutputValue' \
-            --output text)
+          CLUSTER=$(aws ecs list-clusters --region ${{ env.AWS_REGION }} \
+            --query 'clusterArns[?contains(@, `EcsCdkStack-dev`)]' --output text)
+          SERVICE=$(aws ecs list-services --cluster $CLUSTER --region ${{ env.AWS_REGION }} \
+            --query 'serviceArns[0]' --output text)
           echo "Cluster: $CLUSTER"
           echo "Service: $SERVICE"
           aws ecs update-service \
