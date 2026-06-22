@@ -116,7 +116,7 @@ export class EcsCdkStack extends cdk.Stack {
           ? elbv2.ApplicationProtocol.HTTPS
           : elbv2.ApplicationProtocol.HTTP,
         circuitBreaker: { rollback: true },
-        assignPublicIp: true,
+        assignPublicIp: false,
         enableExecuteCommand: true,
       },
     );
