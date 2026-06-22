@@ -169,5 +169,13 @@ export class EcsCdkStack extends cdk.Stack {
       value: this.repository.repositoryUri,
       description: 'ECR Repository URI for CI/CD',
     });
+
+    new cdk.CfnOutput(this, 'ClusterName', {
+      value: this.cluster.clusterName,
+    });
+
+    new cdk.CfnOutput(this, 'ServiceName', {
+      value: this.service.service.serviceName,
+    });
   }
 }

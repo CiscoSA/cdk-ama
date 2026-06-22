@@ -1,4 +1,4 @@
-name: Build, Push to ECR and Deploy to Dev
+name: Build, Push and Deploy to Dev
 
 on:
   push:
@@ -47,12 +47,44 @@ jobs:
             -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
 
-  deploy:
+      - name: Force new deployment
+        if: github.event_name == 'push' && github.ref == 'refs/heads/app'
+        run: |
+          CLUSTER=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.CDK_STACK }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`ClusterName`].OutputValue' \
+            --output text)
+          SERVICE=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.CDK_STACK }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`ServiceName`].OutputValue' \
+            --output text)
+          echo "Cluster: $CLUSTER"
+          echo "Service: $SERVICE"
+          aws ecs update-service \
+            --cluster $CLUSTER \
+            --service $SERVICE \
+            --force-new-deployment
+
+      - name: Verify deployment
+        if: github.event_name == 'push' && github.ref == 'refs/heads/app'
+        run: |
+          sleep 30
+          SERVICE_URL=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.CDK_STACK }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`ServiceURL`].OutputValue' \
+            --output text)
+          echo "Service URL: $SERVICE_URL"
+          curl -sf $SERVICE_URL/_status.json || exit 1
+
+  infra:
     needs: build
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/app'
+    if: >
+      github.event_name == 'push' && github.ref == 'refs/heads/app' &&
+      (contains(github.event.head_commit.modified, 'lib/') ||
+       contains(github.event.head_commit.modified, 'bin/') ||
+       contains(github.event.head_commit.modified, 'cdk.json'))
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -76,15 +108,5 @@ jobs:
         run: |
           npx cdk deploy \
             --context env=dev \
-            --context imageTag=${{ github.sha }} \
             --require-approval never \
             --require-approval broadening
-
-      - name: Verify deployment
-        run: |
-          SERVICE_URL=$(aws cloudformation describe-stacks \
-            --stack-name ${{ env.CDK_STACK }} \
-            --query 'Stacks[0].Outputs[?OutputKey==`ServiceURL`].OutputValue' \
-            --output text)
-          echo "Service URL: $SERVICE_URL"
-          curl -sf $SERVICE_URL/_status.json || exit 1
