@@ -35,8 +35,16 @@ jobs:
           IMAGE_TAG: ${{ github.sha }}
         run: |
           cd app
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+          docker build \
+            --build-arg REACT_APP_SHARETRIBE_SDK_CLIENT_ID=${{ secrets.REACT_APP_SHARETRIBE_SDK_CLIENT_ID }} \
+            --build-arg REACT_APP_MARKETPLACE_NAME=${{ secrets.REACT_APP_MARKETPLACE_NAME }} \
+            --build-arg REACT_APP_MARKETPLACE_ROOT_URL=${{ secrets.REACT_APP_MARKETPLACE_ROOT_URL }} \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker build \
+            --build-arg REACT_APP_SHARETRIBE_SDK_CLIENT_ID=${{ secrets.REACT_APP_SHARETRIBE_SDK_CLIENT_ID }} \
+            --build-arg REACT_APP_MARKETPLACE_NAME=${{ secrets.REACT_APP_MARKETPLACE_NAME }} \
+            --build-arg REACT_APP_MARKETPLACE_ROOT_URL=${{ secrets.REACT_APP_MARKETPLACE_ROOT_URL }} \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
           echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT

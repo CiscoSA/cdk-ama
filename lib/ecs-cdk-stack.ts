@@ -144,7 +144,7 @@ export class EcsCdkStack extends cdk.Stack {
     });
 
     this.service.targetGroup.configureHealthCheck({
-      path: '/health',
+      path: '/_status.json',
       healthyThresholdCount: 2,
       unhealthyThresholdCount: 3,
       interval: cdk.Duration.seconds(30),
