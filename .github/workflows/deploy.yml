@@ -87,4 +87,4 @@ jobs:
             --query 'Stacks[0].Outputs[?OutputKey==`ServiceURL`].OutputValue' \
             --output text)
           echo "Service URL: $SERVICE_URL"
-          curl -sf $SERVICE_URL/health || exit 1
+          curl -sf $SERVICE_URL/_status.json || exit 1
